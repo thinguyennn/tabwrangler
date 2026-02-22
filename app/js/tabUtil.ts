@@ -1,7 +1,6 @@
 import { StorageLocalPersistState, getStorageLocalPersist } from "./queries";
 import {
-  incrementTotalTabsRemoved,
-  removeTabTime,
+  removeTabAndIncrementRemoved,
   setTabTime,
   setTabTimes,
 } from "./actions/localStorageActions";
@@ -117,9 +116,11 @@ export function onNewTab(tab: chrome.tabs.Tab) {
 }
 
 export async function removeTab(tabId: number) {
-  await incrementTotalTabsRemoved();
+  // Unlock synchronously (in-memory settings cache only, async sync to storage happens inside).
   settings.unlockTab(tabId);
-  await removeTabTime(String(tabId));
+  // Remove tabTime and increment totalTabsRemoved in sequential operations instead of
+  // two interleaved lock acquisitions from separate callers.
+  await removeTabAndIncrementRemoved(String(tabId));
 }
 
 export async function updateClosedCount(
@@ -170,13 +171,20 @@ export function isTabLocked(
     filterGroupedTabs,
     lockedIds,
     whitelist,
-  }: { filterAudio: boolean; filterGroupedTabs: boolean; lockedIds: number[]; whitelist: string[] },
+  }: {
+    filterAudio: boolean;
+    filterGroupedTabs: boolean;
+    lockedIds: number[] | Set<number>;
+    whitelist: string[];
+  },
 ): boolean {
   const tabWhitelistMatch = getWhitelistMatch(tab.url, { whitelist });
+  const hasLockedId =
+    lockedIds instanceof Set ? lockedIds.has(tab.id!) : lockedIds.indexOf(tab.id!) !== -1;
   return (
     tab.pinned ||
     !!tabWhitelistMatch ||
-    (tab.id != null && lockedIds.indexOf(tab.id) !== -1) ||
+    (tab.id != null && hasLockedId) ||
     !!(filterGroupedTabs && "groupId" in tab && tab.groupId > 0) ||
     !!(tab.audible && filterAudio)
   );
@@ -189,4 +197,22 @@ export function shouldTabBeClosed(tab: chrome.tabs.Tab): boolean {
     lockedIds: settings.get("lockedIds"),
     whitelist: settings.get("whitelist"),
   });
+}
+
+/**
+ * Factory that builds the filter context (Set, settings) **once** and returns a reusable
+ * predicate. Use this instead of `shouldTabBeClosed` when filtering arrays of tabs so that
+ * `lockedIds` is converted to a Set once rather than once per tab.
+ *
+ * Example:
+ *   tabs.filter(createShouldTabBeClosedFilter())
+ */
+export function createShouldTabBeClosedFilter(): (tab: chrome.tabs.Tab) => boolean {
+  const filterAudio: boolean = settings.get("filterAudio");
+  const filterGroupedTabs: boolean = settings.get("filterGroupedTabs");
+  // Convert array to Set once so isTabLocked gets O(1) lookups for every tab.
+  const lockedIds = new Set<number>(settings.get<number[]>("lockedIds"));
+  const whitelist: string[] = settings.get("whitelist");
+  return (tab: chrome.tabs.Tab) =>
+    !isTabLocked(tab, { filterAudio, filterGroupedTabs, lockedIds, whitelist });
 }

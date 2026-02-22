@@ -11,12 +11,7 @@ import settings from "../settings";
 import { useStorageLocalPersistQuery } from "../storage";
 import { useUndo } from "../UndoContext";
 
-function keywordFilter(keyword: string) {
-  return function (tab: chrome.tabs.Tab) {
-    const test = new RegExp(escape(keyword), "i");
-    return (tab.title != null && test.exec(tab.title)) || (tab.url != null && test.exec(tab.url));
-  };
-}
+// keywordFilter has been removed and inlined into the useMemo hook for performance
 
 type Sorter = {
   key: string;
@@ -226,13 +221,24 @@ export default function CorralTab() {
   const { data: localStorageData } = useStorageLocalPersistQuery();
   const lastSelectedTabRef = React.useRef<TabWithIndex | null>(null);
   const [selectedTabs, setSelectedTabs] = React.useState<Set<string>>(new Set());
+
+  const deferredFilter = React.useDeferredValue(filter);
+
   const closedTabs: TabWithIndex[] = React.useMemo(() => {
     if (localStorageData == null || !("savedTabs" in localStorageData)) return [];
+
+    const searchRegex = deferredFilter.length > 0 ? new RegExp(escape(deferredFilter), "i") : null;
+
     return localStorageData.savedTabs
       .map((tab: chrome.tabs.Tab, index: number): TabWithIndex => ({ tab, index }))
-      .filter(({ tab }: TabWithIndex) => keywordFilter(filter)(tab))
+      .filter(({ tab }: TabWithIndex) =>
+        searchRegex == null
+          ? true
+          : (tab.title != null && searchRegex.test(tab.title)) ||
+            (tab.url != null && searchRegex.test(tab.url)),
+      )
       .sort((a: TabWithIndex, b: TabWithIndex) => currSorter.sort(a.tab, b.tab));
-  }, [currSorter, filter, localStorageData]);
+  }, [currSorter, deferredFilter, localStorageData]);
 
   const areAllClosedTabsSelected =
     closedTabs.length > 0 && closedTabs.every(({ tab }) => selectedTabs.has(serializeTab(tab)));

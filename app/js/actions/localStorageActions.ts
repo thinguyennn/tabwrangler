@@ -1,4 +1,9 @@
 import { SessionTab, TabWithIndex } from "../types";
+import {
+  removeTabTime as cacheRemoveTabTime,
+  setTabTime as cacheSetTabTime,
+  setTabTimes as cacheSetTabTimes,
+} from "../tabTimesCache";
 import { ASYNC_LOCK } from "../storage";
 import { getStorageLocalPersist } from "../queries";
 import { serializeTab } from "../util";
@@ -91,48 +96,43 @@ export function openTabs(tabs: Array<chrome.tabs.Tab>): Promise<chrome.tabs.Tab[
 }
 
 export function setTabTime(tabId: string, tabTime: number) {
-  return ASYNC_LOCK.acquire("local.tabTimes", async () => {
-    const { tabTimes } = await chrome.storage.local.get({ tabTimes: {} });
-    await chrome.storage.local.set({
-      tabTimes: {
-        ...tabTimes,
-        [tabId]: tabTime,
-      },
-    });
-  });
+  cacheSetTabTime(tabId, tabTime);
 }
 
 export function setTabTimes(tabIds: string[], tabTime: number) {
-  return ASYNC_LOCK.acquire("local.tabTimes", async () => {
-    const { tabTimes } = await chrome.storage.local.get({ tabTimes: {} });
-    tabIds.forEach((tabId) => {
-      tabTimes[tabId] = tabTime;
-    });
-    await chrome.storage.local.set({
-      tabTimes,
-    });
-  });
+  cacheSetTabTimes(tabIds, tabTime);
 }
 
 export function incrementTotalTabsRemoved() {
   return ASYNC_LOCK.acquire("persist:localStorage", async () => {
     const localStorage = await getStorageLocalPersist();
+    localStorage.totalTabsRemoved += 1;
     await chrome.storage.local.set({
-      "persist:localStorage": {
-        ...localStorage,
-        totalTabsRemoved: localStorage.totalTabsRemoved + 1,
-      },
+      "persist:localStorage": localStorage,
     });
   });
 }
 
 export function removeTabTime(tabId: string) {
-  return ASYNC_LOCK.acquire("local.tabTimes", async () => {
-    const { tabTimes } = await chrome.storage.local.get({ tabTimes: {} });
-    delete tabTimes[tabId];
-    await chrome.storage.local.set({
-      tabTimes,
-    });
+  cacheRemoveTabTime(tabId);
+}
+
+/**
+ * Removes a tab's time entry AND increments totalTabsRemoved in a single
+ * pair of storage operations instead of two separate lock+read+write cycles.
+ * Use this instead of calling removeTabTime + incrementTotalTabsRemoved separately.
+ */
+export async function removeTabAndIncrementRemoved(tabId: string): Promise<void> {
+  // Remove tabTime instantly using cache
+  cacheRemoveTabTime(tabId);
+
+  // Increment counter: separate key, cannot be batched with tabTimes without a schema change.
+  // Still one lock + one read + one write (same as before), but now sequential with the tabTime
+  // removal rather than interleaved randomly through the lock queue.
+  await ASYNC_LOCK.acquire("persist:localStorage", async () => {
+    const localStorage = await getStorageLocalPersist();
+    localStorage.totalTabsRemoved += 1;
+    await chrome.storage.local.set({ "persist:localStorage": localStorage });
   });
 }
 

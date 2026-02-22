@@ -1,23 +1,29 @@
+/* eslint-disable sort-imports */
 import { ASYNC_LOCK, migrateLocal } from "./js/storage";
+import { getStorageLocalPersist, getStorageSyncPersist } from "./js/queries";
 import {
-  StorageLocalPersistState,
-  getStorageLocalPersist,
-  getStorageSyncPersist,
-} from "./js/queries";
+  cleanUpTabTimesByUrl,
+  forceSyncTabTimes,
+  getTabTimes,
+  initTabTimes,
+  setTabTimeByUrlSilent,
+  setTabTimeSilent,
+} from "./js/tabTimesCache";
 import {
+  createShouldTabBeClosedFilter,
   initTabs,
   onNewTab,
   removeTab,
-  shouldTabBeClosed,
   updateClosedCount,
   updateLastAccessed,
   wrangleTabs,
   wrangleTabsAndPersist,
 } from "./js/tabUtil";
 import Menus from "./js/menus";
-import { debounce } from "lodash-es";
 import { removeAllSavedTabs } from "./js/actions/localStorageActions";
 import settings from "./js/settings";
+import { debounce } from "./js/debounce";
+/* eslint-enable sort-imports */
 
 const menus = new Menus();
 
@@ -34,16 +40,18 @@ function setPaused(paused: boolean): Promise<void> {
   }
 }
 
-const debouncedUpdateLastAccessed = debounce(updateLastAccessed, 1000);
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const debouncedUpdateLastAccessed = debounce((tabId: any) => {
+  updateLastAccessed(tabId);
+}, 1000);
 chrome.runtime.onInstalled.addListener(async () => {
   await settings.init();
   if (settings.get("createContextMenu")) Menus.create();
   migrateLocal();
 });
 
-chrome.tabs.onActivated.addListener(async function onActivated(tabInfo) {
-  await settings.init();
-
+chrome.tabs.onActivated.addListener(function onActivated(tabInfo) {
+  // settings.init() removed — already called in startup() before scheduleCheckToClose.
   if (settings.get("createContextMenu")) menus.updateContextMenus(tabInfo.tabId);
 
   if (settings.get("debounceOnActivated")) {
@@ -65,11 +73,8 @@ chrome.tabs.onRemoved.addListener(removeTab);
 
 chrome.tabs.onReplaced.addListener(function replaceTab(addedTabId: number, removedTabId: number) {
   ASYNC_LOCK.acquire(["local.tabTimes", "persist:settings"], async () => {
-    // Read from both storage areas in parallel (they are independent).
-    const [{ lockedIds }, { tabTimes }] = await Promise.all([
-      chrome.storage.sync.get({ lockedIds: [] }),
-      chrome.storage.local.get({ tabTimes: {} }),
-    ]);
+    // Read lockedIds from sync storage
+    const { lockedIds } = await chrome.storage.sync.get({ lockedIds: [] });
 
     // Replace tab ID in array of locked IDs if the removed tab was locked
     if (lockedIds.indexOf(removedTabId) !== -1) {
@@ -79,12 +84,13 @@ chrome.tabs.onReplaced.addListener(function replaceTab(addedTabId: number, remov
     }
 
     // Replace tab ID in object of tab times keeping the same time remaining for the added tab ID
-    tabTimes[addedTabId] = tabTimes[removedTabId];
-    delete tabTimes[removedTabId];
-    await chrome.storage.local.set({
-      tabTimes,
-    });
-    console.debug("[onReplaced] Replaced tab time: removedId, addedId", removedTabId, addedTabId);
+    const tabTimes = getTabTimes();
+    if (tabTimes[String(removedTabId)]) {
+      setTabTimeSilent(String(addedTabId), tabTimes[String(removedTabId)]);
+      delete tabTimes[String(removedTabId)];
+      await forceSyncTabTimes(); // Force a sync to disk
+      console.debug("[onReplaced] Replaced tab time: removedId, addedId", removedTabId, addedTabId);
+    }
   });
 });
 
@@ -108,15 +114,20 @@ chrome.commands.onCommand.addListener((command) => {
 chrome.storage.onChanged.addListener((changes, areaName) => {
   switch (areaName) {
     case "local": {
-      updateClosedCount();
+      if ("persist:localStorage" in changes) {
+        updateClosedCount();
+      }
       break;
     }
 
     case "sync": {
-      if (changes.minutesInactive || changes.secondsInactive) {
+      if (changes.daysInactive || changes.minutesInactive || changes.secondsInactive) {
         // Reset stored `tabTimes` because setting was changed otherwise old times may exceed new
         // setting value.
         initTabs();
+
+        // Also immediately reschedule the closing check so the new interval format takes effect
+        scheduleCheckToClose();
       }
 
       if (changes["persist:settings"]) {
@@ -136,25 +147,32 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   }
 });
 
-function getTabsOlderThan(
-  tabTimes: StorageLocalPersistState["tabTimes"],
-  time: number,
-): Array<number> {
+function getTabsOlderThan(tabTimes: { [tabId: string]: number }, time: number): Array<number> {
   const ret: Array<number> = [];
-  for (const i in tabTimes) {
-    if (Object.prototype.hasOwnProperty.call(tabTimes, i)) {
-      if (!time || tabTimes[i] < time) {
-        ret.push(parseInt(i, 10));
-      }
+  for (const [key, value] of Object.entries(tabTimes)) {
+    if (!time || value < time) {
+      ret.push(parseInt(key, 10));
     }
   }
   return ret;
 }
 
-let checkToCloseTimeout: NodeJS.Timeout | undefined;
+// Name for the chrome.alarms-based check-to-close alarm.
+const CHECK_TO_CLOSE_ALARM = "checkToClose";
+
 function scheduleCheckToClose() {
-  if (checkToCloseTimeout != null) clearTimeout(checkToCloseTimeout);
-  checkToCloseTimeout = setTimeout(checkToClose, 5000);
+  const stayOpenTime = settings.get<number>("stayOpen");
+  // Calculate a proportional interval — check ~20 times across the stayOpen window.
+  // chrome.alarms minimum is 30 seconds (0.5 min). Cap is 3 hours = 10800000ms.
+  const intervalMs = Math.max(30000, Math.min(10800000, stayOpenTime / 20));
+  const intervalMinutes = intervalMs / 60000;
+
+  console.debug(
+    `[scheduleCheckToClose] Scheduling next check in ${Math.round(intervalMs / 1000)}s`,
+  );
+  // Using chrome.alarms instead of setTimeout so the alarm survives service worker suspension.
+  // The previous alarm (if any) is replaced because we use a fixed name.
+  chrome.alarms.create(CHECK_TO_CLOSE_ALARM, { delayInMinutes: intervalMinutes });
 }
 
 async function checkToClose() {
@@ -167,7 +185,7 @@ async function checkToClose() {
     const minTabs = settings.get<number>("minTabs");
     const tabsToCloseCandidates = await ASYNC_LOCK.acquire("local.tabTimes", async () => {
       const allTabs = await chrome.tabs.query({});
-      const { tabTimes } = await chrome.storage.local.get({ tabTimes: {} });
+      const tabTimes = getTabTimes(); // Read from synchronous in-memory cache
 
       // Tabs which have been locked via the checkbox.
       const lockedIds = new Set(settings.get<Array<number>>("lockedIds"));
@@ -177,7 +195,7 @@ async function checkToClose() {
       // Update selected tabs to make sure they don't get closed.
       const activeTabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
       activeTabs.forEach((tab) => {
-        tabTimes[String(tab.id)] = updatedAt;
+        setTabTimeSilent(String(tab.id), updatedAt);
       });
 
       // Update audible tabs if the setting is enabled to prevent them from being closed.
@@ -186,9 +204,11 @@ async function checkToClose() {
         // some Chromium browsers.
         // @see https://github.com/tabwrangler/tabwrangler/issues/519
         allTabs.forEach((tab) => {
-          if (tab.audible) tabTimes[String(tab.id)] = updatedAt;
+          if (tab.audible) setTabTimeSilent(String(tab.id), updatedAt);
         });
       }
+
+      const shouldTabBeClosed = createShouldTabBeClosedFilter();
 
       function findTabsToCloseCandidates(
         tabs: chrome.tabs.Tab[],
@@ -204,7 +224,7 @@ async function checkToClose() {
           //   when we add a new one
           for (let i = 0; i < tabs.length; i++) {
             const tabId = tabs[i].id;
-            if (tabId != null && resetIfNoCandidates) tabTimes[tabId] = updatedAt;
+            if (tabId != null && resetIfNoCandidates) setTabTimeSilent(String(tabId), updatedAt);
           }
           return [];
         }
@@ -223,7 +243,7 @@ async function checkToClose() {
             // Update its time so it gets checked less frequently.
             // Would also be smart to just never add it.
             // @todo: fix that.
-            tabTimes[String(tabId)] = updatedAt;
+            setTabTimeSilent(String(tabId), updatedAt);
             continue;
           }
           candidates.push(tabsToCut[i]);
@@ -239,45 +259,62 @@ async function checkToClose() {
         });
       } else {
         // * "givenWindow" (default) - count tabs within any given window
-        const windows = await chrome.windows.getAll({ populate: true });
+        const windows = await chrome.windows.getAll({ populate: false });
+
+        // Group existing allTabs by windowId to avoid a heavy populate: true query.
+        const tabsByWindowId = allTabs.reduce(
+          (acc, tab) => {
+            if (tab.windowId != null) {
+              if (!acc[tab.windowId]) acc[tab.windowId] = [];
+              acc[tab.windowId].push(tab);
+            }
+            return acc;
+          },
+          {} as Record<number, chrome.tabs.Tab[]>,
+        );
+
         candidateTabs = windows
           .map((win) =>
-            win.tabs == null
+            win.id == null
               ? []
-              : findTabsToCloseCandidates(win.tabs, { resetIfNoCandidates: win.focused }),
+              : findTabsToCloseCandidates(tabsByWindowId[win.id] || [], {
+                resetIfNoCandidates: win.focused,
+              }),
           )
           .reduce((acc, candidates) => acc.concat(candidates), []);
       }
 
-      // Populate and cull `tabTimes` before storing again.
-      // * Tab was missing from the object? the `tabs.query` will return it and its time will be
-      //   populated
-      // * Tab no longer exists? reducing `tabs.query` will not yield that dead tab ID and it will
-      //   not exist in resulting `nextTabTimes`
-      const nextTabTimes: { [key: string]: number } = {};
-      const nextTabTimesByUrl: { [url: string]: number } = {};
+      // Cleanup the cache to string keys for alive tabs only
+      const aliveTabIds = new Set(allTabs.map((t) => String(t.id)));
+      for (const tabId of Object.keys(tabTimes)) {
+        if (!aliveTabIds.has(tabId)) {
+          delete tabTimes[tabId];
+        }
+      }
+
+      const aliveUrls = new Set<string>();
       for (const tab of allTabs) {
         if (tab.id != null) {
-          const time = tabTimes[tab.id] || updatedAt;
-          nextTabTimes[tab.id] = time;
+          const time = tabTimes[String(tab.id)] || updatedAt;
+          setTabTimeSilent(String(tab.id), time);
           // Also store by URL so countdowns survive browser restart (tab IDs change).
-          // For duplicate URLs, keep the oldest timestamp (closest to being closed).
           if (tab.url) {
-            const existing = nextTabTimesByUrl[tab.url];
-            if (existing == null || time < existing) {
-              nextTabTimesByUrl[tab.url] = time;
-            }
+            setTabTimeByUrlSilent(tab.url, time);
+            aliveUrls.add(tab.url);
           }
         }
       }
 
-      // Piggyback tabTimesByUrl onto the existing storage write — zero extra I/O.
-      await chrome.storage.local.set({ tabTimes: nextTabTimes, tabTimesByUrl: nextTabTimesByUrl });
+      cleanUpTabTimesByUrl(Array.from(aliveUrls));
+
+      await forceSyncTabTimes(); // Instantly sync `tabTimes` and `tabTimesByUrl` memory caches to storage
 
       return candidateTabs;
     });
 
-    const tabsToClose = tabsToCloseCandidates.filter(shouldTabBeClosed);
+    // Candidates were already filtered by shouldTabBeClosed inside the lock (line 198).
+    // Settings don't change within a single cycle, so re-filtering is redundant.
+    const tabsToClose = tabsToCloseCandidates;
 
     if (tabsToClose.length > 0) {
       await ASYNC_LOCK.acquire("persist:localStorage", async () => {
@@ -342,7 +379,9 @@ async function startup() {
       }
     }
 
-    await chrome.storage.local.set({ tabTimes: nextTabTimes });
+    initTabTimes(nextTabTimes, tabTimesByUrl); // Initialize the in-memory caches
+    await forceSyncTabTimes(); // Sync disk so it instantly matches memory setup
+
     if (migrated > 0) {
       console.debug(`[startup] Migrated ${migrated} tab timer(s) from previous session via URL`);
     }
@@ -357,39 +396,60 @@ async function startup() {
 
 startup();
 
-// Keep the [service worker (Chrome) / background script (Firefox)] alive so background can check
-// for tabs to close frequently.
-// Self-contained workaround for https://crbug.com/1316588 (Apache License)
-// Source: https://bugs.chromium.org/p/chromium/issues/detail?id=1316588#c99
-let lastAlarm = 0;
-(async function lostEventsWatchdog() {
-  let quietCount = 0;
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    await new Promise((resolve) => setTimeout(resolve, 65000));
-    const now = Date.now();
-    const age = now - lastAlarm;
-    console.debug(
-      lastAlarm === 0
-        ? `[lostEventsWatchdog]: first alarm`
-        : `[lostEventsWatchdog]: last alarm ${age / 1000}s ago`,
-    );
-    if (age < 95000) {
-      quietCount = 0; // alarm still works.
-    } else if (++quietCount >= 3) {
-      console.warn("[lostEventsWatchdog]: reloading!");
-      return chrome.runtime.reload();
-    } else {
-      chrome.alarms.create(`lostEventsWatchdog/${now}`, { delayInMinutes: 0.5 });
-    }
-  }
-})();
+// NOTE: lostEventsWatchdog is disabled because checkToClose now uses chrome.alarms,
+// which survive service worker suspension natively. The watchdog's while(true) loop
+// was actively preventing the service worker from sleeping between checks.
+// Re-enable if alarms ever prove unreliable (the watchdog would detect broken alarms
+// and force-reload the extension).
+//
+// let lastAlarm = 0;
+// (async function lostEventsWatchdog() {
+//   let quietCount = 0;
+//   while (true) {
+//     await new Promise((resolve) => setTimeout(resolve, 65000));
+//     const now = Date.now();
+//     const age = now - lastAlarm;
+//     console.debug(
+//       lastAlarm === 0
+//         ? `[lostEventsWatchdog]: first alarm`
+//         : `[lostEventsWatchdog]: last alarm ${age / 1000}s ago`,
+//     );
+//     if (age < 95000) {
+//       quietCount = 0;
+//     } else if (++quietCount >= 3) {
+//       console.warn("[lostEventsWatchdog]: reloading!");
+//       return chrome.runtime.reload();
+//     } else {
+//       chrome.alarms.create(`lostEventsWatchdog/${now}`, { delayInMinutes: 0.5 });
+//     }
+//   }
+// })();
 
-chrome.alarms.onAlarm.addListener(() => (lastAlarm = Date.now()));
-chrome.runtime.onMessage.addListener((message) => {
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === CHECK_TO_CLOSE_ALARM) {
+    checkToClose();
+  }
+});
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message === "reload") {
     console.warn("[runtime.onMessage]: Manual reload");
     chrome.runtime.reload();
     return true;
+  } else if (message.action === "getTabTimes") {
+    sendResponse(getTabTimes());
+    return true;
   } else return false;
+});
+
+// If the browser is closing (the very last window is being removed), we want to make
+// sure our in-memory cache is fully synced to disk immediately.
+chrome.windows.onRemoved.addListener(async () => {
+  const windows = await chrome.windows.getAll();
+  // If no windows exist anymore, the browser is effectively shutting down.
+  // We can't use Chrome's suspend event because edge cases exist where background scripts
+  // die ungracefully. This gives us the best chance to save data.
+  if (windows.length === 0) {
+    console.debug("[windows.onRemoved] Last window closed, forcing tab times to disk...");
+    await forceSyncTabTimes();
+  }
 });

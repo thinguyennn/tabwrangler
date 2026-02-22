@@ -1,13 +1,17 @@
 import NavBar, { NavBarTabID } from "./NavBar";
-import AboutTab from "./AboutTab/AboutTab";
-import CorralTab from "./CorralTab/CorralTab";
-import LockTab from "./LockTab/LockTab";
-import OptionsTab from "./OptionsTab/OptionsTab";
 import React from "react";
 import { UndoProvider } from "./UndoContext";
 import { register } from "timeago.js";
 import timeagoLocale from "./timeagoLocale";
 import { useStorageSyncPersistQuery } from "./storage";
+
+// Lazy-load each tab so it's only downloaded when the user navigates to it.
+// This splits the 1MB monolithic bundle into smaller per-tab chunks.
+const AboutTab = React.lazy(() => import("./AboutTab/AboutTab"));
+const CorralTab = React.lazy(() => import("./CorralTab/CorralTab"));
+const LockTab = React.lazy(() => import("./LockTab/LockTab"));
+const OptionsTab = React.lazy(() => import("./OptionsTab/OptionsTab"));
+
 
 export default function Popup() {
   const { data: storageSyncPersistData } = useStorageSyncPersistQuery();
@@ -71,7 +75,9 @@ export default function Popup() {
   return (
     <UndoProvider>
       <NavBar activeTabId={activeTabId} onClickTab={setActiveTabId} />
-      <div className="tab-content container-fluid">{activeTab}</div>
+      <div className="tab-content container-fluid">
+        <React.Suspense fallback={null}>{activeTab}</React.Suspense>
+      </div>
     </UndoProvider>
   );
 }

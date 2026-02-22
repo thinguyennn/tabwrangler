@@ -21,7 +21,7 @@ interface ClosedTabRowProps {
   ) => void;
 }
 
-export default function ClosedTabRow({
+const ClosedTabRow = React.memo(function ClosedTabRow({
   index,
   isSelected,
   session,
@@ -118,4 +118,6 @@ export default function ClosedTabRow({
       </div>
     </div>
   );
-}
+});
+
+export default ClosedTabRow;

@@ -41,6 +41,9 @@ export const SETTINGS_DEFAULTS = {
   // * "givenWindow" (default) - count tabs within any given window
   minTabsStrategy: "givenWindow",
 
+  // How many days (+ minutesInactive + secondsInactive) before we consider a tab "stale".
+  daysInactive: 0,
+
   // How many minutes (+ secondsInactive) before we consider a tab "stale" and ready to close.
   minutesInactive: 60,
 
@@ -241,6 +244,17 @@ const Settings = {
     return Settings.setValue("minTabs", parsedValue);
   },
 
+  setdaysInactive(daysInactive: string): Promise<void> {
+    const days = parseInt(daysInactive, 10);
+    if (isNaN(days) || days < 0) {
+      throw Error(
+        chrome.i18n.getMessage("settings_setdaysInactive_error") ||
+          "Error: settings.setdaysInactive",
+      );
+    }
+    return Settings.setValue("daysInactive", daysInactive);
+  },
+
   setminutesInactive(minutesInactive: string): Promise<void> {
     const minutes = parseInt(minutesInactive, 10);
     if (isNaN(minutes) || minutes < 0) {
@@ -272,6 +286,7 @@ const Settings = {
    */
   stayOpen(): number {
     return (
+      parseInt(this.get("daysInactive"), 10) * 86400000 + // days
       parseInt(this.get("minutesInactive"), 10) * 60000 + // minutes
       parseInt(this.get("secondsInactive"), 10) * 1000 // seconds
     );

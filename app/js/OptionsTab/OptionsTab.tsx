@@ -229,6 +229,26 @@ export default function OptionsTab() {
               <div className="input-group">
                 <input
                   className="form-control"
+                  defaultValue={settings.get("daysInactive")}
+                  id="daysInactive"
+                  max="365"
+                  min="0"
+                  name="daysInactive"
+                  onChange={handleSettingsChange}
+                  title={
+                    chrome.i18n.getMessage("options_option_timeInactive_days") ||
+                    "Tabs stay open for this many days"
+                  }
+                  type="number"
+                />
+                <span className="input-group-text">days</span>
+              </div>
+            </div>
+            <div className="w-auto p-0 mx-n1">:</div>
+            <div className="col-4">
+              <div className="input-group">
+                <input
+                  className="form-control"
                   defaultValue={settings.get("minutesInactive")}
                   id="minutesInactive"
                   max="7200"
@@ -244,7 +264,7 @@ export default function OptionsTab() {
               </div>
             </div>
             <div className="w-auto p-0 mx-n1">:</div>
-            <div className="col-4">
+            <div className="col-3">
               <div className="input-group">
                 <input
                   className="form-control"
