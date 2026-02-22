@@ -28,13 +28,13 @@ export const SETTINGS_DEFAULTS = {
   lockedWindowIds: defaultLockedWindowIds,
 
   // Saved sort order for list of open tabs. When null, default sort is used (tab order)
-  lockTabSortOrder: null,
+  lockTabSortOrder: "reverseChrono",
 
   // Max number of tabs stored before the list starts getting truncated.
   maxTabs: 1000,
 
   // Stop acting if there are only minTabs tabs open.
-  minTabs: 20,
+  minTabs: 50,
 
   // Strategy for counting minTabs
   // * "allWindows" - sum tabs across all open browser windows
@@ -42,10 +42,10 @@ export const SETTINGS_DEFAULTS = {
   minTabsStrategy: "givenWindow",
 
   // How many days (+ minutesInactive + secondsInactive) before we consider a tab "stale".
-  daysInactive: 0,
+  daysInactive: 5,
 
   // How many minutes (+ secondsInactive) before we consider a tab "stale" and ready to close.
-  minutesInactive: 60,
+  minutesInactive: 0,
 
   // Save closed tabs in between browser sessions.
   purgeClosedTabs: false,
@@ -57,7 +57,7 @@ export const SETTINGS_DEFAULTS = {
   showBadgeCount: false,
 
   // An array of patterns to check against. If a URL matches a pattern, it is never locked.
-  whitelist: ["about:", "chrome://"],
+  whitelist: [],
 
   // Allow duplicate entries in the closed/wrangled tabs list
   wrangleOption: "withDupes",
